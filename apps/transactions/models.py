@@ -28,6 +28,10 @@ class Transaction(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["user_id", "created_at"]),
+            models.Index(fields=["merchant_name"]),
+        ]
 
 
 class IdempotencyKey(models.Model):
