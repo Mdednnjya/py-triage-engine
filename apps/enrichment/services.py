@@ -29,7 +29,7 @@ class EnrichmentService:
 
     def enrich(self, transaction):
 
-        from apps.enrichment import circuit_breaker
+        from apps.enrichment import circuit_breaker, agent
 
         from apps.core.metrics import enrichment_duration_seconds, enrichment_status_total
 
@@ -44,6 +44,15 @@ class EnrichmentService:
             # time
             t0 = time.time()
             explanation = self._call_llm(transaction)
+
+            confidence = explanation.get("confidence") if isinstance(explanation, dict) else None
+            escalate_on = {c.strip().lower() for c in config("AGENT_ESCALATION_CONFIDENCE", default="low,medium").split(",")}
+
+            # verdict
+            if confidence is None or str(confidence).lower() in escalate_on:
+                investigation = agent.investigate(transaction, explanation)
+                explanation = investigation["explanation"]
+
             elapsed = time.time() - t0
             duration_ms = int(elapsed * 1000)
             circuit_breaker.record_success()
@@ -58,6 +67,11 @@ class EnrichmentService:
                 explanation=explanation,
                 model=config("OPENROUTER_MODEL", default="mistral/mistral-7b-instruct"),
             )
+        except agent.CircuitOpenError:
+            logger.info("circuit open mid-investigation", extra={"transaction_id": str(transaction.id), "status": "PENDING"})
+            enrichment_status_total.labels(status="PENDING").inc()
+            documents.update_status_if_not_terminal(transaction.id, "PENDING")
+            return
         except Exception:
             logger.info("llm failed", extra={"transaction_id": str(transaction.id), "status": "FAILED"})
             circuit_breaker.record_failure()

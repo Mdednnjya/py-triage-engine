@@ -143,7 +143,7 @@ class TestEnrichmentService:
 
         mock_response = MagicMock()
         mock_response.json.return_value = {
-            "choices": [{"message": {"content": '{"summary": "test", "risk_factors": [], "recommended_action": "approve", "confidence": "low"}'}}]
+            "choices": [{"message": {"content": '{"summary": "test", "risk_factors": [], "recommended_action": "approve", "confidence": "high"}'}}]
         }
         mock_response.raise_for_status = MagicMock()
 
@@ -158,3 +158,97 @@ class TestEnrichmentService:
 
                         mock_record_success.assert_called_once()
                         mock_update.assert_called_once()
+
+    def test_enrich_skips_investigation_on_high_confidence(self):
+
+        from apps.transactions.models import Transaction
+
+        # seed
+        transaction = Transaction.objects.create(
+            amount=60_000_000,
+            currency="IDR",
+            user_id="user-enrich-6",
+            merchant_name="Merchant Z",
+            status="AUTO_BLOCK",
+            risk_score=60,
+            reasons=["amount exceeds threshold"],
+            idempotency_key="enrich-key-6",
+        )
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "test", "risk_factors": ["amount exceeds threshold"], "recommended_action": "block", "confidence": "high"}'}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        with patch("apps.enrichment.circuit_breaker.allow_request", return_value=True):
+            with patch("apps.enrichment.services.requests.post", return_value=mock_response):
+                with patch("apps.enrichment.agent.investigate") as mock_investigate:
+                    with patch("apps.enrichment.documents.update") as mock_update:
+
+                        # call
+                        service = EnrichmentService()
+                        service.enrich(transaction)
+
+                        mock_investigate.assert_not_called()
+                        mock_update.assert_called_once_with(
+                            transaction.id,
+                            "COMPLETED",
+                            explanation={
+                                "summary": "test",
+                                "risk_factors": ["amount exceeds threshold"],
+                                "recommended_action": "block",
+                                "confidence": "high",
+                            },
+                            model=ANY,
+                        )
+
+    def test_enrich_escalates_and_saves_merged_verdict_on_low_confidence(self):
+
+        from apps.transactions.models import Transaction
+
+        # seed
+        transaction = Transaction.objects.create(
+            amount=35_000_000,
+            currency="IDR",
+            user_id="user-enrich-7",
+            merchant_name="Merchant Z",
+            status="NEEDS_REVIEW",
+            risk_score=30,
+            reasons=["location mismatch"],
+            idempotency_key="enrich-key-7",
+        )
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": '{"summary": "borderline", "risk_factors": ["location mismatch"], "recommended_action": "hold", "confidence": "low"}'}}]
+        }
+        mock_response.raise_for_status = MagicMock()
+
+        investigation_result = {
+            "explanation": {
+                "summary": "checked history, no prior flags",
+                "risk_factors": ["location mismatch"],
+                "recommended_action": "approve",
+                "confidence": "high",
+            },
+            "iterations": 2,
+            "tool_calls": [{"tool": "get_user_flag_history", "args": {"user_id": "user-enrich-7"}}],
+        }
+
+        with patch("apps.enrichment.circuit_breaker.allow_request", return_value=True):
+            with patch("apps.enrichment.services.requests.post", return_value=mock_response):
+                with patch("apps.enrichment.agent.investigate", return_value=investigation_result) as mock_investigate:
+                    with patch("apps.enrichment.documents.update") as mock_update:
+
+                        # call
+                        service = EnrichmentService()
+                        service.enrich(transaction)
+
+                        mock_investigate.assert_called_once()
+                        mock_update.assert_called_once_with(
+                            transaction.id,
+                            "COMPLETED",
+                            explanation=investigation_result["explanation"],
+                            model=ANY,
+                        )
