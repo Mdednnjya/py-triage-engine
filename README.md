@@ -3,8 +3,9 @@
 A Django REST API that receives payment webhook events and screens each
 transaction through a deterministic rule engine, returning one of three
 outcomes: AUTO_APPROVE, NEEDS_REVIEW, or AUTO_BLOCK. Flagged transactions
-are enriched asynchronously with an LLM-generated explanation for human
-reviewers.
+are enriched asynchronously with an LLM-generated explanation; when the
+first-pass confidence is low or medium, an investigation agent gathers
+additional context through tool calls before issuing a final verdict.
 
 ## Why This Project
 
@@ -25,7 +26,7 @@ when something went wrong.
 Request flow with layered separation:
 - View — HTTP handler, validates request, returns 202 immediately
 - Service — rule engine evaluation, idempotency check, enqueue logic
-- Task — Celery async worker, circuit breaker check, LLM call, enrichment persistence
+- Task — Celery async worker, circuit breaker check, LLM call with tool-calling investigation loop for low or medium confidence enrichments, enrichment persistence
 - Beat — reconciliation job every 5 minutes; re-queues stale PENDING when circuit closed
 - Repository — PostgreSQL via Django ORM, MongoDB via pymongo
 - Observability — Prometheus metrics scrape; Grafana dashboard
@@ -40,9 +41,9 @@ Python 3.12 · Django 5 · Django REST Framework · Celery · Redis · PostgreSQ
 - Rule engine: AmountRule, FrequencyRule, GeoMismatchRule; deterministic score routing
 - Idempotency guard with select_for_update; duplicate webhooks blocked at DB level
 - Celery async worker decouples LLM enrichment from request thread; enrichment state machine: QUEUED; PROCESSING; COMPLETED; FAILED; PENDING
-- Redis-backed circuit breaker with HALF-OPEN trial lock; graceful degradation to PENDING when circuit open
-- Reconciliation job via Celery beat; re-queues stale PENDING enrichments when circuit closed
-- Polyglot persistence: PostgreSQL for transactions; MongoDB for enrichment documents; joined at application layer; Prometheus metrics and Grafana dashboard instrument the full pipeline
+- Confidence-based escalation to tool-calling investigation agent; three read-only tools, hard cap 3 iterations, trace persisted to MongoDB
+- Redis-backed circuit breaker with HALF-OPEN trial lock; graceful degradation to PENDING when circuit open; reconciliation job re-queues stale PENDING when circuit closed
+- Polyglot persistence: PostgreSQL for transactions; MongoDB for enrichment documents; Prometheus metrics and Grafana dashboard instrument the full pipeline; agent iterations and tool calls exposed as Prometheus metrics
 
 ## Engineering Decisions
 
@@ -57,6 +58,9 @@ Python 3.12 · Django 5 · Django REST Framework · Celery · Redis · PostgreSQ
 | Circuit OPEN leaves PENDING enrichments permanently | Dashboard shows stale state indefinitely | Reconciliation job re-queues PENDING when circuit CLOSED; eventual completeness |
 | Multiple workers race on HALF-OPEN trial | Two workers both attempt trial LLM call | Redis SET NX EX trial lock; only one worker proceeds |
 | Pipeline blind under async load | No visibility into bottleneck location | request_id flows end-to-end; Prometheus metrics per stage; Grafana dashboard |
+| Low-confidence enrichment pushes investigation onto reviewers | Generic explanations; manual queries per case | Confidence-based escalation to tool-calling agent loop; LLM gathers context autonomously |
+| Agent loop could run away on ambiguous cases | Unbounded LLM calls; cost and latency blowup | Hard cap at 3 iterations; forced finalize with accumulated context |
+| Investigation queries scan unindexed columns | Sequential scans on user_id and merchant_name | Composite index (user_id, created_at); merchant_name index |
 
 ## Enrichment Output
 
@@ -84,6 +88,51 @@ LLM explanation is stored as structured JSON, not free-form text:
 ![dashboard_pending](./docs/benchmarks/fault-tolerance/dashboard_pending.png)
 
 </details>
+
+## Agentic Investigation
+
+One-shot enrichment has a blind spot: when the LLM lacks context, it
+returns a low-confidence verdict with a generic explanation, pushing
+the actual investigation onto the human reviewer — even though the
+data needed (user history, prior flags, merchant patterns) already
+sits in the system's own databases.
+
+The fix is confidence-based escalation. First-pass enrichment stays
+a single cheap call. If confidence comes back low or medium, the
+transaction escalates to an investigation loop where the LLM can
+request data through three read-only tools: user transaction history,
+user flag history, and merchant flag statistics. The LLM decides
+which tools to call and when it has enough context; Python executes
+every query and feeds results back. Hard cap at 3 iterations, then
+the agent is forced to finalize with available information.
+
+The circuit breaker wraps the entire investigation as one unit — if
+the circuit opens mid-loop, the investigation aborts to PENDING with
+no partial state saved, and reconciliation restarts it from scratch.
+Stateless restart over resumable state: partial findings can go stale
+during a long circuit-open window, and a fresh start guarantees the
+agent always decides from current data.
+
+Investigation trace from a live run — borderline transaction
+(risk_score 30, single rule), agent called all three tools before
+finalizing at the iteration cap:
+
+```json
+"investigation_trace": {
+  "iterations": 3,
+  "tool_calls": [
+    {"tool": "get_user_transaction_history", "args": {"user_id": "user-verify-agentic-3", "window_days": 30}},
+    {"tool": "get_user_flag_history", "args": {"user_id": "user-verify-agentic-3"}},
+    {"tool": "get_merchant_flag_stats", "args": {"merchant_name": "Toko Elektronik Jaya"}}
+  ]
+}
+```
+
+The final verdict referenced the merchant's 100% flag rate pulled
+from tool data — a materially more specific explanation than the
+first-pass alone could produce. Every trace is persisted to MongoDB
+and surfaced in the dashboard so reviewers can see the agent's
+reasoning path.
 
 ## Load Test — Synchronous Path (before fix)
 
