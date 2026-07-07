@@ -27,6 +27,18 @@ reconciliation_requeued_total = Counter(
     "Total enrichments re-queued by reconciliation job",
 )
 
+agent_iterations = Histogram(
+    "agent_iterations",
+    "Number of loop iterations per investigation",
+    buckets=[0, 1, 2, 3],
+)
+
+agent_tool_calls_total = Counter(
+    "agent_tool_calls_total",
+    "Total tool calls made during investigation loops",
+    ["tool"],
+)
+
 
 class _CircuitBreakerCollector:
 

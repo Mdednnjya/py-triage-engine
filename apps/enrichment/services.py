@@ -48,10 +48,16 @@ class EnrichmentService:
             confidence = explanation.get("confidence") if isinstance(explanation, dict) else None
             escalate_on = {c.strip().lower() for c in config("AGENT_ESCALATION_CONFIDENCE", default="low,medium").split(",")}
 
+            investigation_trace = None
+
             # verdict
             if confidence is None or str(confidence).lower() in escalate_on:
                 investigation = agent.investigate(transaction, explanation)
                 explanation = investigation["explanation"]
+                investigation_trace = {
+                    "iterations": investigation["iterations"],
+                    "tool_calls": investigation["tool_calls"],
+                }
 
             elapsed = time.time() - t0
             duration_ms = int(elapsed * 1000)
@@ -66,6 +72,7 @@ class EnrichmentService:
                 "COMPLETED",
                 explanation=explanation,
                 model=config("OPENROUTER_MODEL", default="mistral/mistral-7b-instruct"),
+                investigation_trace=investigation_trace,
             )
         except agent.CircuitOpenError:
             logger.info("circuit open mid-investigation", extra={"transaction_id": str(transaction.id), "status": "PENDING"})

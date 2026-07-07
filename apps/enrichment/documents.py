@@ -21,13 +21,15 @@ def save(transaction_id, explanation, status, model):
     })
 
 
-def update(transaction_id, status, explanation=None, model=None):
+def update(transaction_id, status, explanation=None, model=None, investigation_trace=None):
 
     fields = {"enrichment_status": status}
     if explanation is not None:
         fields["explanation"] = explanation
     if model is not None:
         fields["model"] = model
+    if investigation_trace is not None:
+        fields["investigation_trace"] = investigation_trace
 
     _collection().update_one(
         {"transaction_id": str(transaction_id)},

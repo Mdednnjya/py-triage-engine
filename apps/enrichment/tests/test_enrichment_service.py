@@ -46,6 +46,7 @@ class TestEnrichmentService:
                         "confidence": "high",
                     },
                     model=ANY,
+                    investigation_trace=None,
                 )
 
     def test_enrich_raises_on_llm_failure(self):
@@ -201,6 +202,7 @@ class TestEnrichmentService:
                                 "confidence": "high",
                             },
                             model=ANY,
+                            investigation_trace=None,
                         )
 
     def test_enrich_escalates_and_saves_merged_verdict_on_low_confidence(self):
@@ -251,4 +253,8 @@ class TestEnrichmentService:
                             "COMPLETED",
                             explanation=investigation_result["explanation"],
                             model=ANY,
+                            investigation_trace={
+                                "iterations": investigation_result["iterations"],
+                                "tool_calls": investigation_result["tool_calls"],
+                            },
                         )

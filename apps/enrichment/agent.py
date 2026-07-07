@@ -35,6 +35,7 @@ class CircuitOpenError(Exception):
 def investigate(transaction, first_pass_result):
 
     from apps.enrichment import circuit_breaker
+    from apps.core.metrics import agent_iterations, agent_tool_calls_total
 
     messages = [
         {"role": "system", "content": _INVESTIGATOR_SYSTEM_PROMPT},
@@ -66,6 +67,9 @@ def investigate(transaction, first_pass_result):
                 result = TOOL_REGISTRY[name](**args)
                 tool_calls_summary.append({"tool": name, "args": args})
 
+                agent_tool_calls_total.labels(tool=name).inc()
+                logger.info("agent tool call", extra={"transaction_id": str(transaction.id), "tool": name})
+
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call["id"],
@@ -73,6 +77,9 @@ def investigate(transaction, first_pass_result):
                 })
 
             continue
+
+        agent_iterations.observe(iteration + 1)
+        logger.info("agent verdict", extra={"transaction_id": str(transaction.id), "iterations": iteration + 1})
 
         return {
             "explanation": _parse_verdict(message.get("content", "")),
@@ -86,6 +93,9 @@ def investigate(transaction, first_pass_result):
 
     messages.append({"role": "user", "content": "finalize now with available information"})
     message = _call_llm(messages)
+
+    agent_iterations.observe(max_iterations)
+    logger.info("agent verdict", extra={"transaction_id": str(transaction.id), "iterations": max_iterations})
 
     return {
         "explanation": _parse_verdict(message.get("content", "")),
